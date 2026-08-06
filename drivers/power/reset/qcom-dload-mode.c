@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2020, 2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022,2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/delay.h>
@@ -17,11 +17,18 @@
 #include <linux/panic_notifier.h>
 #include <linux/qcom_scm.h>
 #include <soc/qcom/minidump.h>
+#include <linux/regulator/consumer.h>
 
 enum qcom_download_dest {
 	QCOM_DOWNLOAD_DEST_UNKNOWN = -1,
 	QCOM_DOWNLOAD_DEST_QPST = 0,
 	QCOM_DOWNLOAD_DEST_EMMC = 2,
+};
+
+struct reg_info {
+	struct regulator *reg;
+	int uV;
+	int uA;
 };
 
 struct qcom_dload {
@@ -32,7 +39,14 @@ struct qcom_dload {
 
 	bool in_panic;
 	bool in_reboot;
+	bool in_reboot_edl;
+
 	void __iomem *dload_dest_addr;
+
+	struct regulator *mmcx_supply;
+	struct reg_info *regs;
+	int reg_cnt;
+	struct device *dev;
 };
 
 #define to_qcom_dload(o) container_of(o, struct qcom_dload, kobj)
@@ -255,6 +269,58 @@ static struct attribute_group qcom_dload_attr_group = {
 	.attrs = qcom_dload_attrs,
 };
 
+static int poweroff_init_regulator(struct qcom_dload *poweroff)
+{
+	int len;
+	int i, rc;
+	char uv_ua[50];
+	u32 uv_ua_vals[2];
+	const char *reg_name;
+
+	poweroff->reg_cnt = of_property_count_strings(poweroff->dev->of_node,
+						  "reg-names");
+	if (poweroff->reg_cnt <= 0) {
+		pr_err("poweroff: No regulators added!\n");
+		return 0;
+	}
+
+	poweroff->regs = devm_kzalloc(poweroff->dev,
+				  sizeof(struct reg_info) * poweroff->reg_cnt,
+				  GFP_KERNEL);
+	if (!poweroff->regs)
+		return -ENOMEM;
+
+	for (i = 0; i < poweroff->reg_cnt; i++) {
+		of_property_read_string_index(poweroff->dev->of_node, "reg-names",
+					      i, &reg_name);
+
+		poweroff->regs[i].reg = devm_regulator_get(poweroff->dev, reg_name);
+		if (IS_ERR(poweroff->regs[i].reg)) {
+			pr_err("poweroff: failed to get %s reg\n", reg_name);
+			return PTR_ERR(poweroff->regs[i].reg);
+		}
+
+		/* Read current(uA) and voltage(uV) value */
+		snprintf(uv_ua, sizeof(uv_ua), "%s-uV-uA", reg_name);
+		if (!of_find_property(poweroff->dev->of_node, uv_ua, &len))
+			continue;
+
+		rc = of_property_read_u32_array(poweroff->dev->of_node, uv_ua,
+						uv_ua_vals,
+						ARRAY_SIZE(uv_ua_vals));
+		if (rc) {
+			pr_err("poweroff: Failed to read uVuA value(rc:%d)\n", rc);
+			return rc;
+		}
+
+		if (uv_ua_vals[0] > 0)
+			poweroff->regs[i].uV = uv_ua_vals[0];
+		if (uv_ua_vals[1] > 0)
+			poweroff->regs[i].uA = uv_ua_vals[1];
+	}
+	return 0;
+}
+
 static int qcom_dload_panic(struct notifier_block *this, unsigned long event,
 			      void *ptr)
 {
@@ -325,6 +391,7 @@ static int qcom_dload_probe(struct platform_device *pdev)
 	if (!poweroff)
 		return -ENOMEM;
 
+	poweroff->dev = &pdev->dev;
 	ret = kobject_init_and_add(&poweroff->kobj, &qcom_dload_kobj_type,
 				   kernel_kobj, "dload");
 	if (ret) {
@@ -362,7 +429,9 @@ static int qcom_dload_probe(struct platform_device *pdev)
 	register_restart_handler(&poweroff->restart_nb);
 
 	platform_set_drvdata(pdev, poweroff);
-
+	ret = poweroff_init_regulator(poweroff);
+	if (ret)
+		pr_err("poweroff_init_regulator failed.\n");
 	return 0;
 }
 
